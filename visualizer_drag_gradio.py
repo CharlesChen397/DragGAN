@@ -13,6 +13,7 @@ from gradio_utils import (ImageMask, draw_mask_on_image, draw_points_on_image,
                           get_latest_points_pair, get_valid_mask,
                           on_change_single_global_state)
 from viz.renderer import Renderer, add_watermark_np
+from inversion_utils import InversionModule
 
 parser = ArgumentParser()
 parser.add_argument('--share', action='store_true',default='True')
@@ -27,6 +28,258 @@ args = parser.parse_args()
 cache_dir = args.cache_dir
 
 device = 'cuda'
+
+# Initialize inversion module (lazy loading)
+inversion_module = None
+
+
+def get_inversion_module():
+    """Lazy initialization of inversion module."""
+    global inversion_module
+    if inversion_module is None:
+        inversion_module = InversionModule(device=device)
+    return inversion_module
+
+
+def invert_uploaded_image(image, method, global_state):
+    """
+    Invert uploaded image to latent space with real-time progress display.
+    
+    Args:
+        image: PIL Image uploaded by user
+        method: 'Optimization' or 'PTI'
+        global_state: application state
+        
+    Yields:
+        tuple: (global_state, progress_image)
+    """
+    if image is None:
+        yield global_state, None
+        return
+    
+    try:
+        inv_module = get_inversion_module()
+        renderer = global_state['renderer']
+        
+        # Make sure generator is initialized
+        if not hasattr(renderer, 'G'):
+            print("Generator not initialized, initializing now...")
+            init_images(global_state)
+        
+        G = renderer.G
+        
+        # Create progress display images
+        from PIL import ImageDraw, ImageFont
+        
+        def create_progress_image(step, total_steps, loss_info=""):
+            """Create a progress visualization image."""
+            # Match the display size to avoid layout jumping
+            img_size = 1024  # Match StyleGAN resolution
+            img = Image.new('RGB', (img_size, img_size), color=(30, 30, 30))
+            draw = ImageDraw.Draw(img)
+            
+            # Try to load font, fallback to default if not available
+            try:
+                font = ImageFont.truetype('arial.ttf', 48)
+                small_font = ImageFont.truetype('arial.ttf', 32)
+            except:
+                font = ImageFont.load_default()
+                small_font = font
+            
+            # Draw progress bar
+            bar_width = 800
+            bar_height = 60
+            bar_x = (img_size - bar_width) // 2
+            bar_y = 400
+            
+            # Background
+            draw.rectangle([bar_x, bar_y, bar_x + bar_width, bar_y + bar_height], 
+                          fill=(60, 60, 60), outline=(100, 100, 100), width=2)
+            
+            # Progress fill
+            progress = step / total_steps
+            fill_width = int(bar_width * progress)
+            draw.rectangle([bar_x, bar_y, bar_x + fill_width, bar_y + bar_height],
+                          fill=(0, 150, 255))
+            
+            # Text
+            text = f"Optimizing: {step}/{total_steps} ({progress*100:.1f}%)"
+            bbox = draw.textbbox((0, 0), text, font=font)
+            text_width = bbox[2] - bbox[0]
+            draw.text((img_size//2 - text_width//2, 300), text, fill=(255, 255, 255), font=font)
+            
+            if loss_info:
+                bbox = draw.textbbox((0, 0), loss_info, font=small_font)
+                text_width = bbox[2] - bbox[0]
+                draw.text((img_size//2 - text_width//2, 500), loss_info, fill=(200, 200, 200), font=small_font)
+            
+            return img
+        
+        # Choose inversion method
+        if method == 'PTI':
+            num_steps = 450 + 350  # Initial inversion + PTI steps
+            print(f"Starting PTI inversion with {num_steps} total steps...")
+            yield global_state, create_progress_image(0, num_steps, "Initializing PTI...")
+            
+            from inversion_utils import InversionModule
+            inv_module = InversionModule(device=device)
+            
+            # Shared list to collect progress updates
+            progress_updates = []
+            
+            def progress_callback(step, loss):
+                loss_info = f"Loss: {loss:.4f}"
+                progress_updates.append((step, loss_info))
+            
+            try:
+                w_latent, G_tuned = inv_module.pti_invert(
+                    image, G,
+                    num_pti_steps=350,
+                    initial_inversion_steps=450,
+                    pti_lr=5e-4,
+                    initial_lr=8e-3,
+                    progress_callback=progress_callback
+                )
+                
+                # Yield collected progress updates
+                for step, loss_info in progress_updates:
+                    yield global_state, create_progress_image(step, num_steps, loss_info)
+                
+                # Use fine-tuned generator
+                G = G_tuned
+                print(f'PTI inversion completed!')
+            except Exception as e:
+                print(f"PTI inversion failed: {e}, falling back to optimization")
+                method = 'Optimization'
+                num_steps = 3000
+        
+        if method == 'Optimization':
+            num_steps = 3000
+            print(f"Starting optimization inversion with {num_steps} steps...")
+            
+            # Show initial progress
+            yield global_state, create_progress_image(0, num_steps, "Initializing...")
+            
+            from inversion_utils import InversionModule
+            inv_module = InversionModule(device=device)
+            
+            # Inline optimization with yield
+            import copy
+            from torchvision import transforms
+            import torch.nn.functional as F
+            
+            # Preprocess
+            target_h = G.img_resolution
+            target_w = G.img_resolution
+            transform = transforms.Compose([
+                transforms.Resize((target_h, target_w)),
+                transforms.ToTensor(),
+                transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
+            ])
+            img_tensor = transform(image).unsqueeze(0).to(device)
+            
+            # Setup
+            G_copy = copy.deepcopy(G).eval().requires_grad_(False).to(device)
+            z_samples = torch.randn([10000, G_copy.z_dim], device=device)
+            with torch.no_grad():
+                w_samples = G_copy.mapping(z_samples, None)[:, :1, :]
+                w_avg = w_samples.mean(dim=0, keepdim=True)
+            
+            w = w_avg.detach().clone().repeat(1, G_copy.num_ws, 1)
+            w.requires_grad = True
+            
+            optimizer = torch.optim.Adam([w], lr=0.01, betas=(0.9, 0.999))
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_steps)
+            
+            # LPIPS
+            try:
+                from lpips import LPIPS
+                lpips_fn = LPIPS(net='alex').to(device).eval()
+                for param in lpips_fn.parameters():
+                    param.requires_grad = False
+            except:
+                lpips_fn = None
+            
+            best_loss = float('inf')
+            best_w = w.detach().clone()
+            
+            # Optimization loop with progress updates
+            for step in range(num_steps):
+                synth_img = G_copy.synthesis(w, noise_mode='const')
+                mse_loss = F.mse_loss(synth_img, img_tensor)
+                
+                if lpips_fn is not None:
+                    lpips_loss = lpips_fn(synth_img, img_tensor).mean()
+                    total_loss = mse_loss * 1.0 + lpips_loss * 1.0
+                else:
+                    total_loss = mse_loss
+                
+                if step < num_steps // 2:
+                    w_reg = ((w - w_avg.repeat(1, G_copy.num_ws, 1)) ** 2).mean() * 0.01
+                    total_loss = total_loss + w_reg
+                
+                optimizer.zero_grad()
+                total_loss.backward()
+                optimizer.step()
+                scheduler.step()
+                
+                if total_loss.item() < best_loss:
+                    best_loss = total_loss.item()
+                    best_w = w.detach().clone()
+                
+                # Yield progress
+                if step % 50 == 0 or step == num_steps - 1:
+                    progress_img = create_progress_image(step + 1, num_steps, f"Loss: {total_loss.item():.4f}")
+                    yield global_state, progress_img
+                    print(f'Step {step}/{num_steps}: Loss={total_loss.item():.4f}')
+            
+            w_latent = best_w
+            print(f'Optimization completed! Best loss: {best_loss:.4f}')
+        
+        # Reconstruct and update state
+        global_state['inversion_mode'] = True
+        global_state['uploaded_image'] = image
+        global_state['renderer'].w_load = w_latent
+        global_state['renderer'].init_network(
+            global_state['generator_params'],
+            valid_checkpoints_dict[global_state['pretrained_weight']],
+            global_state['params']['seed'],
+            w_latent,
+            global_state['params']['latent_space'] == 'w+',
+            'const',
+            global_state['params']['trunc_psi'],
+            global_state['params']['trunc_cutoff'],
+            None,
+            global_state['params']['lr']
+        )
+        
+        global_state['renderer']._render_drag_impl(
+            global_state['generator_params'],
+            is_drag=False,
+            to_pil=True
+        )
+        
+        reconstructed_image = global_state['generator_params'].image
+        global_state['images']['image_orig'] = reconstructed_image
+        global_state['images']['image_raw'] = reconstructed_image
+        global_state['images']['image_show'] = Image.fromarray(
+            add_watermark_np(np.array(reconstructed_image))
+        )
+        
+        clear_state(global_state)
+        
+        print("Successfully inverted image")
+        yield global_state, global_state['images']['image_show']
+        
+    except Exception as e:
+        print(f"Error during inversion: {e}")
+        import traceback
+        traceback.print_exc()
+        # Return error image
+        error_img = Image.new('RGB', (512, 512), color=(50, 0, 0))
+        draw = ImageDraw.Draw(error_img)
+        draw.text((150, 250), f"Error: {str(e)[:50]}", fill=(255, 255, 255))
+        yield global_state, error_img
 
 
 def reverse_point_pairs(points):
@@ -198,7 +451,10 @@ with gr.Blocks() as app:
         "curr_point": None,
         "curr_type_point": "start",
         'editing_state': 'add_points',
-        'pretrained_weight': init_pkl
+        'pretrained_weight': init_pkl,
+        # New fields for inversion
+        'inversion_mode': False,  # Flag to indicate if using inverted image
+        'uploaded_image': None,  # Store original uploaded image
     })
 
     # init image
@@ -252,6 +508,29 @@ with gr.Blocks() as app:
                                     label='Latent space to optimize',
                                     show_label=False,
                                 )
+                
+                # GAN Inversion - Upload Real Image
+                with gr.Row():
+                    with gr.Column(scale=1, min_width=10):
+                        gr.Markdown(value='Upload', show_label=False)
+                    
+                    with gr.Column(scale=4, min_width=10):
+                        upload_image = gr.Image(
+                            type="pil",
+                            label="Upload Real Image",
+                            interactive=True
+                        )
+                        inversion_method = gr.Radio(
+                            choices=['Optimization', 'PTI'],
+                            value='Optimization',
+                            label='Inversion Method',
+                            info='Optimization: Fast (3000 steps). PTI: Higher quality (800 steps total)',
+                            interactive=True
+                        )
+                        invert_button = gr.Button("Invert Image")
+
+
+
 
                 # Drag
                 with gr.Row():
@@ -302,20 +581,30 @@ with gr.Blocks() as app:
                     interactive=True,
                     visible=False)
 
-            # Right --> Image
+            # Right --> Image (在右侧栏顶部)
             with gr.Column(scale=8):
                 form_image = ImageMask(
                     value=global_state.value['images']['image_show'],
                     brush_radius=20).style(
                         width=768,
                         height=768)  # NOTE: hard image size code here.
+
     gr.Markdown("""
         ## Quick Start
 
+        ### Option 1: Generate from Random Seed
         1. Select desired `Pretrained Model` and adjust `Seed` to generate an
            initial image.
         2. Click on image to add control points.
         3. Click `Start` and enjoy it!
+
+        ### Option 2: Upload Real Image (NEW!)
+        1. Upload your own image in the `Upload Real Image` section.
+        2. Choose inversion method:
+           * `Optimization`: Fast (3000 steps, ~5-10 minutes)
+           * `PTI`: Higher quality (initial + fine-tuning, ~15-20 minutes)
+        3. Click `Invert Image` and watch real-time progress.
+        4. After completion, add control points and click `Start` to edit!
 
         ## Advance Usage
 
@@ -380,6 +669,14 @@ with gr.Blocks() as app:
         on_click_reset_image,
         inputs=[global_state],
         outputs=[global_state, form_image],
+    )
+    
+    # GAN Inversion button click handler
+    invert_button.click(
+        invert_uploaded_image,
+        inputs=[upload_image, inversion_method, global_state],
+        outputs=[global_state, form_image],
+        show_progress="hidden"  # Hide default progress to avoid UI jumping
     )
 
     # Update parameters
