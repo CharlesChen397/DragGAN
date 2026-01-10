@@ -1,7 +1,9 @@
 import os
 import os.path as osp
+import tempfile
 from argparse import ArgumentParser
 from functools import partial
+import json
 
 import gradio as gr
 import numpy as np
@@ -16,12 +18,12 @@ from viz.renderer import Renderer, add_watermark_np
 from inversion_utils import InversionModule
 
 parser = ArgumentParser()
-parser.add_argument('--share', action='store_true',default='True')
+parser.add_argument('--share', action='store_true', default=False)
 parser.add_argument('--cache-dir', type=str, default='./checkpoints')
 parser.add_argument(
-    "--listen",
-    action="store_true",
-    help="launch gradio with 0.0.0.0 as server name, allowing to respond to network requests",
+    '--listen',
+    action='store_true',
+    help='launch gradio with 0.0.0.0 as server name, allowing to respond to network requests',
 )
 args = parser.parse_args()
 
@@ -365,6 +367,36 @@ def update_image_draw(image, points, mask, show_mask, global_state=None):
     return image_draw
 
 
+def serialize_points(points):
+    """Convert points dict to JSON string for reproducible export."""
+    payload = []
+    for idx in sorted(points.keys()):
+        p = points[idx]
+        start = p.get('start')
+        target = p.get('target')
+        if start is None or target is None:
+            continue
+        payload.append({'start': [int(start[0]), int(start[1])],
+                        'target': [int(target[0]), int(target[1])]})
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def deserialize_points(points_json):
+    """Parse JSON string to points dict format used by UI."""
+    data = json.loads(points_json) if points_json else []
+    points = {}
+    for i, item in enumerate(data):
+        start = item.get('start')
+        target = item.get('target')
+        if start is None or target is None:
+            continue
+        points[i] = {
+            'start': [int(round(start[0])), int(round(start[1]))],
+            'target': [int(round(target[0])), int(round(target[1]))],
+        }
+    return points
+
+
 def preprocess_mask_info(global_state, image):
     """Function to handle mask information.
     1. last_mask is None: Do not need to change mask, return mask
@@ -416,7 +448,7 @@ print(valid_checkpoints_dict)
 
 init_pkl = 'stylegan2_lions_512_pytorch'
 
-with gr.Blocks() as app:
+with gr.Blocks(css=".top-align-row{align-items:flex-start !important;} .top-align-col{align-self:flex-start !important;} .drag-image img{margin-top:0 !important;}") as app:
 
     # renderer = Renderer()
     global_state = gr.State({
@@ -443,6 +475,10 @@ with gr.Blocks() as app:
             "trunc_psi": 0.7,
             "trunc_cutoff": None,
             "lr": 0.001,
+            "tracker_type": "NN",
+            "tracker_lambda": 0.5,
+            "max_steps": 200,
+            "stop_thresh_px": 2,
         },
         "device": device,
         "draw_interval": 1,
@@ -462,7 +498,7 @@ with gr.Blocks() as app:
 
     with gr.Row():
 
-        with gr.Row():
+        with gr.Row(elem_classes=["top-align-row"]):
 
             # Left --> tools
             with gr.Column(scale=3):
@@ -495,6 +531,36 @@ with gr.Blocks() as app:
                             value=global_state.value["params"]["lr"],
                             interactive=True,
                             label="Step Size")
+                        
+                        form_tracker_type = gr.Radio(
+                            ['NN', 'RAFT', 'HYBRID', 'MULTISCALE'],
+                            value=global_state.value['params']['tracker_type'],
+                            interactive=True,
+                            label='Tracking Method',
+                        )
+
+                        form_tracker_lambda = gr.Slider(
+                            minimum=0.0,
+                            maximum=2.0,
+                            step=0.05,
+                            value=global_state.value['params']['tracker_lambda'],
+                            label='Tracker Lambda (Hybrid distance weight)',
+                            interactive=True,
+                            visible=global_state.value['params']['tracker_type'] == 'HYBRID',
+                        )
+
+                        form_max_steps = gr.Number(
+                            value=global_state.value['params']['max_steps'],
+                            interactive=True,
+                            label="Max Steps",
+                        )
+
+                        form_stop_thresh = gr.Number(
+                            value=global_state.value['params']['stop_thresh_px'],
+                            interactive=True,
+                            label="Stop Threshold (px)",
+                            info="Distance to target below this will stop early",
+                        )
 
                         with gr.Row():
                             with gr.Column(scale=2, min_width=10):
@@ -552,6 +618,32 @@ with gr.Blocks() as app:
                                                       label="Steps",
                                                       interactive=False)
 
+                        form_distance_info = gr.Textbox(
+                            label="Distances (px)",
+                            interactive=False,
+                            value="",
+                        )
+
+                        form_download_result_file = gr.File(
+                            label="Download Result",
+                            visible=False,
+                        )
+
+                # Points IO
+                with gr.Row():
+                    with gr.Column(scale=1, min_width=10):
+                        gr.Markdown(value='Points IO', show_label=False)
+                    with gr.Column(scale=4, min_width=10):
+                        with gr.Row():
+                            form_export_points = gr.Button('Export Points')
+                            form_import_points = gr.Button('Load Points')
+                        form_points_json = gr.Textbox(
+                            label='Points JSON',
+                            lines=3,
+                            placeholder='[{"start": [x, y], "target": [x, y]}]',
+                            interactive=True,
+                        )
+
                 # Mask
                 with gr.Row():
                     with gr.Column(scale=1, min_width=10):
@@ -582,12 +674,15 @@ with gr.Blocks() as app:
                     visible=False)
 
             # Right --> Image (在右侧栏顶部)
-            with gr.Column(scale=8):
+            with gr.Column(scale=8, elem_classes=["top-align-col"]):
                 form_image = ImageMask(
                     value=global_state.value['images']['image_show'],
-                    brush_radius=20).style(
-                        width=768,
-                        height=768)  # NOTE: hard image size code here.
+                    brush_radius=20,
+                    width=768,
+                    height=768,
+                    show_label=False,
+                    elem_classes=["drag-image"],
+                )
 
     gr.Markdown("""
         ## Quick Start
@@ -734,13 +829,58 @@ with gr.Blocks() as app:
             print(renderer.w_optim)
         return global_state
 
+    def on_change_max_steps(v, global_state):
+        global_state["params"]["max_steps"] = int(v)
+        return global_state
+
+    def on_change_stop_thresh(v, global_state):
+        global_state["params"]["stop_thresh_px"] = float(v)
+        return global_state
+
     form_lr_number.change(
         on_change_lr,
         inputs=[form_lr_number, global_state],
         outputs=[global_state],
     )
 
-    def on_click_start(global_state, image):
+    def on_change_tracker_type(tracker_type, global_state):
+        global_state['params']['tracker_type'] = tracker_type
+        return global_state, gr.Slider.update(visible=(tracker_type == 'HYBRID'))
+
+    form_tracker_type.change(
+        on_change_tracker_type,
+        inputs=[form_tracker_type, global_state],
+        outputs=[global_state, form_tracker_lambda],
+    )
+
+    form_tracker_lambda.change(
+        partial(on_change_single_global_state, ["params", "tracker_lambda"]),
+        inputs=[form_tracker_lambda, global_state],
+        outputs=[global_state],
+    )
+
+    form_max_steps.change(
+        on_change_max_steps,
+        inputs=[form_max_steps, global_state],
+        outputs=[global_state],
+    )
+
+    form_stop_thresh.change(
+        on_change_stop_thresh,
+        inputs=[form_stop_thresh, global_state],
+        outputs=[global_state],
+    )
+
+    def on_click_start(global_state, image, max_steps_val, stop_thresh_val):
+        # sync latest numeric inputs in case change events didn't fire
+        if max_steps_val is not None:
+            global_state['params']['max_steps'] = int(max_steps_val)
+        if stop_thresh_val is not None:
+            global_state['params']['stop_thresh_px'] = float(stop_thresh_val)
+
+        def sanitize_name(s):
+            return ''.join(c if c.isalnum() or c in ['_', '-', '.'] else '_' for c in s)
+
         p_in_pixels = []
         t_in_pixels = []
         valid_points = []
@@ -780,11 +920,14 @@ with gr.Blocks() as app:
                 gr.Dropdown.update(interactive=True),
                 gr.Number.update(interactive=True),
                 gr.Number.update(interactive=True),
-                gr.Button.update(interactive=True),
-                gr.Button.update(interactive=True),
-                gr.Checkbox.update(interactive=True),
-                # gr.Number.update(interactive=True),
-                gr.Number.update(interactive=True),
+                gr.Radio.update(interactive=True),  # tracker_type
+                gr.Slider.update(interactive=True), # tracker_lambda
+                gr.Number.update(interactive=True), # max_steps
+                gr.Number.update(interactive=True), # stop_thresh
+                gr.Checkbox.update(interactive=True), # show_mask
+                gr.Number.update(interactive=True), # lambda (mask)
+                gr.Textbox.update(value=""),
+                None,
             )
         else:
 
@@ -844,7 +987,10 @@ with gr.Blocks() as app:
                     # img_normalize   = False,
                     # untransform     = False,
                     is_drag=True,
-                    to_pil=True)
+                    to_pil=True,
+                    tracker_type=global_state['params']['tracker_type'],
+                    tracker_lambda=global_state['params']['tracker_lambda'],
+                    stop_thresh_px=global_state['params']['stop_thresh_px'])
 
                 if step_idx % global_state['draw_interval'] == 0:
                     print('Current Source:')
@@ -872,6 +1018,19 @@ with gr.Blocks() as app:
                     )
                     global_state['images']['image_raw'] = image_result
 
+                # compute distances for monitoring
+                dists = []
+                for p_i, t_i in zip(p_to_opt, t_to_opt):
+                    dy = p_i[0] - t_i[0]
+                    dx = p_i[1] - t_i[1]
+                    dists.append((dy*dy + dx*dx) ** 0.5)
+                if len(dists) > 0:
+                    mean_dist = sum(dists) / len(dists)
+                    dist_text = f"mean={mean_dist:.2f}px; per-point={['{:.2f}'.format(d) for d in dists]}"
+                else:
+                    mean_dist = None
+                    dist_text = "No points"
+
                 yield (
                     global_state,
                     step_idx,
@@ -892,15 +1051,22 @@ with gr.Blocks() as app:
                     gr.Dropdown.update(interactive=False),
                     gr.Number.update(interactive=False),
                     gr.Number.update(interactive=False),
-                    gr.Button.update(interactive=False),
-                    gr.Button.update(interactive=False),
-                    gr.Checkbox.update(interactive=False),
-                    # gr.Number.update(interactive=False),
-                    gr.Number.update(interactive=False),
+                    gr.Radio.update(interactive=False),  # tracker_type
+                    gr.Slider.update(interactive=False), # tracker_lambda
+                    gr.Number.update(interactive=False), # max_steps
+                    gr.Number.update(interactive=False), # stop_thresh
+                    gr.Checkbox.update(interactive=False), # show_mask
+                    gr.Number.update(interactive=False), # lambda (mask)
+                    gr.Textbox.update(value=dist_text),
+                    None,
                 )
 
                 # increate step
                 step_idx += 1
+
+                if step_idx >= global_state['params']['max_steps']:
+                    print(f"Reached max_steps={global_state['params']['max_steps']}, stopping.")
+                    break
 
             image_result = global_state['generator_params']['image']
             global_state['images']['image_raw'] = image_result
@@ -909,6 +1075,29 @@ with gr.Blocks() as app:
                                            global_state['mask'],
                                            global_state['show_mask'],
                                            global_state)
+
+            # build download filename
+            model_name = sanitize_name(global_state['pretrained_weight'])
+            tracker_type = sanitize_name(global_state['params']['tracker_type'])
+            lambda_part = ''
+            if tracker_type == 'HYBRID':
+                lambda_part = f"_{global_state['params']['tracker_lambda']:.2f}"
+            if mean_dist is not None:
+                dist_part = f"_{mean_dist:.2f}px"
+            else:
+                dist_part = "_NA"
+            filename = f"{model_name}_{tracker_type}{lambda_part}{dist_part}.png"
+            filename = sanitize_name(filename)
+            download_path = osp.join(tempfile.gettempdir(), filename)
+            try:
+                # save overlay image with points/lines/mask drawn
+                image_draw.save(download_path)
+                download_value = download_path
+                download_visible = True
+            except Exception as e:
+                print(f"Failed to save download file: {e}")
+                download_value = None
+                download_visible = False
 
             # fp = NamedTemporaryFile(suffix=".png", delete=False)
             # image_result.save(fp, "PNG")
@@ -935,13 +1124,19 @@ with gr.Blocks() as app:
                 gr.Dropdown.update(interactive=True),
                 gr.Number.update(interactive=True),
                 gr.Number.update(interactive=True),
-                gr.Checkbox.update(interactive=True),
-                gr.Number.update(interactive=True),
+                gr.Radio.update(interactive=True),  # tracker_type
+                gr.Slider.update(interactive=True), # tracker_lambda
+                gr.Number.update(interactive=True), # max_steps
+                gr.Number.update(interactive=True), # stop_thresh
+                gr.Checkbox.update(interactive=True), # show_mask
+                gr.Number.update(interactive=True), # lambda (mask)
+                gr.Textbox.update(),
+                gr.File.update(value=download_value, visible=download_visible),
             )
 
     form_start_btn.click(
         on_click_start,
-        inputs=[global_state, form_image],
+        inputs=[global_state, form_image, form_max_steps, form_stop_thresh],
         outputs=[
             global_state,
             form_steps_number,
@@ -961,8 +1156,14 @@ with gr.Blocks() as app:
             form_pretrained_dropdown,
             form_seed_number,
             form_lr_number,
+            form_tracker_type,
+            form_tracker_lambda,
+            form_max_steps,
+            form_stop_thresh,
             show_mask,
             form_lambda_number,
+            form_distance_info,
+            form_download_result_file,
         ],
     )
 
@@ -1082,6 +1283,40 @@ with gr.Blocks() as app:
     enable_add_points.click(on_click_add_point,
                             inputs=[global_state, form_image],
                             outputs=[global_state, form_image])
+
+    def on_click_export_points(global_state):
+        return serialize_points(global_state['points'])
+
+    form_export_points.click(
+        on_click_export_points,
+        inputs=[global_state],
+        outputs=[form_points_json],
+    )
+
+    def on_click_import_points(global_state, points_json):
+        try:
+            points = deserialize_points(points_json)
+        except Exception as e:
+            print(f'Failed to load points: {e}')
+            return global_state, global_state['images']['image_show'], form_points_json
+
+        global_state['points'] = points
+        global_state['editing_state'] = 'add_points'
+        image_raw = global_state['images']['image_raw']
+        image_draw = update_image_draw(
+            image_raw,
+            global_state['points'],
+            global_state['mask'],
+            global_state['show_mask'],
+            global_state,
+        )
+        return global_state, image_draw
+
+    form_import_points.click(
+        on_click_import_points,
+        inputs=[global_state, form_points_json],
+        outputs=[global_state, form_image],
+    )
 
     def on_click_image(global_state, evt: gr.SelectData):
         """This function only support click for point selection

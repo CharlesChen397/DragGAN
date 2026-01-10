@@ -21,6 +21,7 @@ import matplotlib.cm
 import dnnlib
 from torch_utils.ops import upfirdn2d
 import legacy # pylint: disable=import-error
+from raft_tracker import RAFTTracker
 
 #----------------------------------------------------------------------------
 
@@ -261,6 +262,8 @@ class Renderer:
 
         self.feat_refs = None
         self.points0_pt = None
+        self.raft_tracker = None
+        self.prev_img_for_raft = None
 
     def update_lr(self, lr):
 
@@ -291,6 +294,7 @@ class Renderer:
         is_drag         = False,
         reset           = False,
         to_pil          = False,
+        stop_thresh_px  = 2,
         **kwargs
     ):
         G = self.G
@@ -304,6 +308,9 @@ class Renderer:
         if reset:
             self.feat_refs = None
             self.points0_pt = None
+            self.prev_img_for_raft = None
+            self.raft_ref_img = None
+            self.raft_ref_points = None
         self.points = points
 
         # Run synthesis network.
@@ -316,29 +323,104 @@ class Renderer:
             X = torch.linspace(0, h, h)
             Y = torch.linspace(0, w, w)
             xx, yy = torch.meshgrid(X, Y)
+            tracker_type = kwargs.get('tracker_type', 'NN')
+            tracker_lambda = kwargs.get('tracker_lambda', 0.5)
+
+            # Base feature for motion supervision
             feat_resize = F.interpolate(feat[feature_idx], [h, w], mode='bilinear')
+
+            # Build tracking feature (single-scale or multi-scale fusion)
+            track_feat_resize = feat_resize
+            if tracker_type in ['MULTISCALE', 'HYBRID', 'HYBRID_LAMBDA']:
+                fuse_indices = [3, 5, 7, 9]
+                fuse_indices = [idx for idx in fuse_indices if idx < len(feat)]
+                if feature_idx not in fuse_indices:
+                    fuse_indices.append(feature_idx)
+                feats_to_fuse = [F.interpolate(feat[idx], [h, w], mode='bilinear') for idx in fuse_indices]
+                track_feat_resize = torch.cat(feats_to_fuse, dim=1)
+
             if self.feat_refs is None:
                 self.feat0_resize = F.interpolate(feat[feature_idx].detach(), [h, w], mode='bilinear')
                 self.feat_refs = []
                 for point in points:
                     py, px = round(point[0]), round(point[1])
-                    self.feat_refs.append(self.feat0_resize[:,:,py,px])
+                    self.feat_refs.append(track_feat_resize.detach()[:,:,py,px])
                 self.points0_pt = torch.Tensor(points).unsqueeze(0).to(self._device) # 1, N, 2
 
-            # Point tracking with feature matching
-            with torch.no_grad():
-                for j, point in enumerate(points):
-                    r = round(r2 / 512 * h)
-                    up = max(point[0] - r, 0)
-                    down = min(point[0] + r + 1, h)
-                    left = max(point[1] - r, 0)
-                    right = min(point[1] + r + 1, w)
-                    feat_patch = feat_resize[:,:,up:down,left:right]
-                    L2 = torch.linalg.norm(feat_patch - self.feat_refs[j].reshape(1,-1,1,1), dim=1)
-                    _, idx = torch.min(L2.view(1,-1), -1)
-                    width = right - left
-                    point = [idx.item() // width + up, idx.item() % width + left]
-                    points[j] = point
+            # Point tracking
+            if tracker_type == 'RAFT' or tracker_type == 'HYBRID':
+                if self.raft_tracker is None:
+                    self.raft_tracker = RAFTTracker(device=self._device)
+
+                # Use a fixed reference image/points from drag start to accumulate full displacement.
+                if self.raft_ref_img is None:
+                    self.raft_ref_img = img.detach()
+                    self.raft_ref_points = torch.tensor(points, device=self._device, dtype=torch.float32)
+
+                with torch.no_grad():
+                    raft_pred = self.raft_tracker.update_points(self.raft_ref_img, img, self.raft_ref_points)
+
+                if tracker_type == 'RAFT':
+                    for j in range(len(points)):
+                        points[j] = raft_pred[j].tolist()
+                else:  # HYBRID: use RAFT prediction to guide NN search window
+                    guided_points = raft_pred.detach().cpu().tolist()
+                    with torch.no_grad():
+                        for j, point in enumerate(points):
+                            guide = guided_points[j]
+                            r = round(r2 / 512 * h)
+                            up = max(int(round(guide[0])) - r, 0)
+                            down = min(int(round(guide[0])) + r + 1, h)
+                            left = max(int(round(guide[1])) - r, 0)
+                            right = min(int(round(guide[1])) + r + 1, w)
+                            feat_patch = track_feat_resize[:,:,up:down,left:right]
+                            L2 = torch.linalg.norm(feat_patch - self.feat_refs[j].reshape(1,-1,1,1), dim=1)
+                            # distance regularizer towards RAFT guide
+                            yy_local, xx_local = torch.meshgrid(
+                                torch.arange(up, down, device=self._device),
+                                torch.arange(left, right, device=self._device),
+                                indexing='ij'
+                            )
+                            dist = ((yy_local - guide[0])**2 + (xx_local - guide[1])**2).sqrt()
+                            dist = dist.unsqueeze(0)  # broadcast over channel dimension after norm
+                            r_norm = r + 1e-6
+                            cost = L2 + tracker_lambda * (dist / r_norm)
+                            _, idx = torch.min(cost.view(1,-1), -1)
+                            width = right - left
+                            point = [idx.item() // width + up, idx.item() % width + left]
+                            points[j] = point
+
+            elif tracker_type == 'HYBRID_LAMBDA' or tracker_type == 'MULTISCALE':
+                # HYBRID_LAMBDA here means: no RAFT; but distance prior is zero (falls back to NN). For clarity, treat as NN on multiscale.
+                with torch.no_grad():
+                    for j, point in enumerate(points):
+                        r = round(r2 / 512 * h)
+                        up = max(point[0] - r, 0)
+                        down = min(point[0] + r + 1, h)
+                        left = max(point[1] - r, 0)
+                        right = min(point[1] + r + 1, w)
+                        feat_patch = track_feat_resize[:,:,up:down,left:right]
+                        L2 = torch.linalg.norm(feat_patch - self.feat_refs[j].reshape(1,-1,1,1), dim=1)
+                        _, idx = torch.min(L2.view(1,-1), -1)
+                        width = right - left
+                        point = [idx.item() // width + up, idx.item() % width + left]
+                        points[j] = point
+
+            else:
+                # Point tracking with feature matching
+                with torch.no_grad():
+                    for j, point in enumerate(points):
+                        r = round(r2 / 512 * h)
+                        up = max(point[0] - r, 0)
+                        down = min(point[0] + r + 1, h)
+                        left = max(point[1] - r, 0)
+                        right = min(point[1] + r + 1, w)
+                        feat_patch = track_feat_resize[:,:,up:down,left:right]
+                        L2 = torch.linalg.norm(feat_patch - self.feat_refs[j].reshape(1,-1,1,1), dim=1)
+                        _, idx = torch.min(L2.view(1,-1), -1)
+                        width = right - left
+                        point = [idx.item() // width + up, idx.item() % width + left]
+                        points[j] = point
 
             res.points = [[point[0], point[1]] for point in points]
 
@@ -347,7 +429,8 @@ class Renderer:
             res.stop = True
             for j, point in enumerate(points):
                 direction = torch.Tensor([targets[j][1] - point[1], targets[j][0] - point[0]])
-                if torch.linalg.norm(direction) > max(2 / 512 * h, 2):
+                thr = max(stop_thresh_px / 512 * h, stop_thresh_px)
+                if torch.linalg.norm(direction) > thr:
                     res.stop = False
                 if torch.linalg.norm(direction) > 1:
                     distance = ((xx.to(self._device) - point[0])**2 + (yy.to(self._device) - point[1])**2)**0.5
