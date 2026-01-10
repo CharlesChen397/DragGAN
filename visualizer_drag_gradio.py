@@ -337,7 +337,7 @@ def init_images(global_state):
         state['params']['trunc_psi'],  # trunc_psi,
         state['params']['trunc_cutoff'],  # trunc_cutoff,
         None,  # input_transform
-        state['params']['lr']  # lr,
+        state['params']['lr'],  # lr,
     )
 
     state['renderer']._render_drag_impl(state['generator_params'],
@@ -479,6 +479,8 @@ with gr.Blocks(css=".top-align-row{align-items:flex-start !important;} .top-alig
             "tracker_lambda": 0.5,
             "max_steps": 200,
             "stop_thresh_px": 2,
+            "feature_blend": False,  # 是否启用特征融合
+            "blend_ratio": 0.5,      # 特征融合比例
         },
         "device": device,
         "draw_interval": 1,
@@ -667,6 +669,20 @@ with gr.Blocks(css=".top-align-row{align-items:flex-start !important;} .top-alig
                                 label="Lambda",
                             )
 
+                        with gr.Row():
+                            feature_blend_checkbox = gr.Checkbox(
+                                label='Enable Feature Blend',
+                                value=global_state.value["params"]["feature_blend"],
+                                show_label=True)
+                            
+                            blend_ratio_slider = gr.Slider(
+                                minimum=0.0,
+                                maximum=1.0,
+                                value=global_state.value["params"]["blend_ratio"],
+                                step=0.05,
+                                label="Blend Ratio",
+                                interactive=True)
+
                 form_draw_interval_number = gr.Number(
                     value=global_state.value["draw_interval"],
                     label="Draw Interval (steps)",
@@ -814,6 +830,18 @@ with gr.Blocks(css=".top-align-row{align-items:flex-start !important;} .top-alig
     form_lambda_number.change(
         partial(on_change_single_global_state, ["params", "motion_lambda"]),
         inputs=[form_lambda_number, global_state],
+        outputs=[global_state],
+    )
+    
+    feature_blend_checkbox.change(
+        partial(on_change_single_global_state, ["params", "feature_blend"]),
+        inputs=[feature_blend_checkbox, global_state],
+        outputs=[global_state],
+    )
+    
+    blend_ratio_slider.change(
+        partial(on_change_single_global_state, ["params", "blend_ratio"]),
+        inputs=[blend_ratio_slider, global_state],
         outputs=[global_state],
     )
 
@@ -991,6 +1019,8 @@ with gr.Blocks(css=".top-align-row{align-items:flex-start !important;} .top-alig
                     tracker_type=global_state['params']['tracker_type'],
                     tracker_lambda=global_state['params']['tracker_lambda'],
                     stop_thresh_px=global_state['params']['stop_thresh_px'])
+                    feature_blend=global_state['params'].get('feature_blend', False),  # 启用特征融合
+                    blend_ratio=global_state['params'].get('blend_ratio', 0.5))  # 混合比例
 
                 if step_idx % global_state['draw_interval'] == 0:
                     print('Current Source:')
@@ -1128,6 +1158,8 @@ with gr.Blocks(css=".top-align-row{align-items:flex-start !important;} .top-alig
                 gr.Slider.update(interactive=True), # tracker_lambda
                 gr.Number.update(interactive=True), # max_steps
                 gr.Number.update(interactive=True), # stop_thresh
+                gr.Button.update(interactive=True),
+                gr.Button.update(interactive=True),
                 gr.Checkbox.update(interactive=True), # show_mask
                 gr.Number.update(interactive=True), # lambda (mask)
                 gr.Textbox.update(),

@@ -295,6 +295,8 @@ class Renderer:
         reset           = False,
         to_pil          = False,
         stop_thresh_px  = 2,
+        feature_blend   = False,  # 新增参数：是否启用特征混合
+        blend_ratio     = 0.5,    # 新增参数：混合比例
         **kwargs
     ):
         G = self.G
@@ -316,6 +318,47 @@ class Renderer:
         # Run synthesis network.
         label = torch.zeros([1, G.c_dim], device=self._device)
         img, feat = G(ws, label, truncation_psi=trunc_psi, noise_mode=noise_mode, input_is_w=True, return_feature=True)
+
+# 如果启用了特征混合
+        if feature_blend and mask is not None and mask.sum() > 0:
+            with torch.no_grad():
+                original_img, original_feat = G(self.w0, label, truncation_psi=trunc_psi, noise_mode=noise_mode, input_is_w=True, return_feature=True)
+            
+            # 1. 准备基础 Mask [1, 1, H, W]
+            mask_base = mask.to(self._device).unsqueeze(0).unsqueeze(0)
+            
+            # 2. 图像层面的混合 (使用平滑插值，保证视觉过渡自然)
+            mask_img = F.interpolate(mask_base, size=img.shape[2:], mode='bilinear', align_corners=False)
+            mask_img = torch.clamp(mask_img, 0, 1)
+            img = img * mask_img + original_img.detach() * (1 - mask_img)
+
+            # 3. 特征层面的混合 (关键修改！！！)
+            # 插值后进行二值化 (Binarize)，防止边缘产生“粘滞”效应
+            # 只有当 mask > 0.5 时才允许特征变化，否则完全锁死
+            mask_feat_raw = F.interpolate(mask_base, size=feat[feature_idx].shape[2:], mode='bilinear', align_corners=False)
+            mask_feat = (mask_feat_raw > 0.5).float() # <--- 强制变为 0.0 或 1.0
+
+            # 调整原始特征尺寸
+            orig_feat_resized = F.interpolate(original_feat[feature_idx].detach(), size=feat[feature_idx].shape[2:], mode='bilinear', align_corners=False)
+            
+            # 应用混合：Mask=1 的区域(允许动)使用新特征，Mask=0 的区域(背景)锁死旧特征
+            feat[feature_idx] = feat[feature_idx] * mask_feat + orig_feat_resized * (1 - mask_feat)
+
+            # --- 调试代码：检查拖拽点是否被锁死 ---
+            # 如果你的点在 mask=0 的区域，它是绝对动不了的
+            if is_drag and hasattr(self, 'points'):
+                for i, point in enumerate(points):
+                    # 将点坐标映射到特征图尺寸
+                    y_f = int(point[0] / img.shape[2] * feat[feature_idx].shape[2])
+                    x_f = int(point[1] / img.shape[3] * feat[feature_idx].shape[3])
+                    # 检查边界
+                    y_f = min(max(y_f, 0), feat[feature_idx].shape[2]-1)
+                    x_f = min(max(x_f, 0), feat[feature_idx].shape[3]-1)
+                    
+                    # 获取该点位置的 mask 值
+                    mask_val = mask_feat[0, 0, y_f, x_f].item()
+                    if mask_val < 0.5:
+                        print(f"警告: 第 {i} 个拖拽点位于 Mask=0 (固定) 区域，无法移动！请检查掩码绘制是否正确。")
 
         h, w = G.img_resolution, G.img_resolution
 
@@ -443,7 +486,8 @@ class Renderer:
                     loss_motion += F.l1_loss(feat_resize[:,:,relis,reljs].detach(), target)
 
             loss = loss_motion
-            if mask is not None:
+            if mask is not None and not feature_blend:
+                # 仅在未启用特征混合时应用原来的掩码损失
                 if mask.min() == 0 and mask.max() == 1:
                     mask_usq = mask.to(self._device).unsqueeze(0).unsqueeze(0)
                     loss_fix = F.l1_loss(feat_resize * mask_usq, self.feat0_resize * mask_usq)
