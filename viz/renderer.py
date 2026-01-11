@@ -264,13 +264,15 @@ class Renderer:
         self.points0_pt = None
         self.raft_tracker = None
         self.prev_img_for_raft = None
+        self.raft_ref_img = None
+        self.raft_ref_points = None
 
     def update_lr(self, lr):
 
         del self.w_optim
         self.w_optim = torch.optim.Adam([self.w], lr=lr)
         print(f'Rebuild optimizer with lr: {lr}')
-        print('    Remain feat_refs and points0_pt')
+        print('     Remain feat_refs and points0_pt')
 
     def _render_drag_impl(self, res,
         points          = [],
@@ -295,8 +297,8 @@ class Renderer:
         reset           = False,
         to_pil          = False,
         stop_thresh_px  = 2,
-        feature_blend   = False,  # 新增参数：是否启用特征混合
-        blend_ratio     = 0.5,    # 新增参数：混合比例
+        feature_blend   = False,
+        blend_ratio     = 0.5,
         **kwargs
     ):
         G = self.G
@@ -315,50 +317,70 @@ class Renderer:
             self.raft_ref_points = None
         self.points = points
 
+        # =========================================================================
+        # 0. 掩码预处理 (归一化 + 二值化 + 【关键：强制反转】)
+        # =========================================================================
+        if mask is not None:
+            # 维度修正
+            if mask.dim() == 3: mask = mask.squeeze(0) 
+            # 归一化 (防止输入是 0-255)
+            if mask.max() > 1:
+                mask = mask.float() / 255.0
+            # 二值化
+            mask = (mask > 0.5).float()
+
+            # 【核心修改】：既然你说行为是反的，这里强制反转
+            # 现在：1.0 = 背景(Background), 0.0 = ROI(Moving Area)
+            # 或者如果你的输入是反的，这行代码会把它掰正
+            mask = 1.0 - mask 
+
         # Run synthesis network.
         label = torch.zeros([1, G.c_dim], device=self._device)
         img, feat = G(ws, label, truncation_psi=trunc_psi, noise_mode=noise_mode, input_is_w=True, return_feature=True)
 
-# 如果启用了特征混合
+        # =========================================================================
+        # 1. 立即备份 Raw 数据 (计算梯度、追踪必须用这些原始数据)
+        # =========================================================================
+        img_raw = img.clone()
+        feat_raw = feat[feature_idx].clone()
+
+        # =========================================================================
+        # 2. 特征/图像混合 (仅用于视觉输出展示)
+        # =========================================================================
+        # =========================================================================
+        # 2. 特征/图像混合 (修正版：引入 blend_ratio 控制)
+        # =========================================================================
+        # 只有当 feature_blend=True 时才尝试混合
+        # 如果 blend_ratio=0，我们希望这部分逻辑即使进入了，也应该表现为“不混合”
         if feature_blend and mask is not None and mask.sum() > 0:
             with torch.no_grad():
                 original_img, original_feat = G(self.w0, label, truncation_psi=trunc_psi, noise_mode=noise_mode, input_is_w=True, return_feature=True)
             
-            # 1. 准备基础 Mask [1, 1, H, W]
             mask_base = mask.to(self._device).unsqueeze(0).unsqueeze(0)
             
-            # 2. 图像层面的混合 (使用平滑插值，保证视觉过渡自然)
+            # --- 图像混合 ---
             mask_img = F.interpolate(mask_base, size=img.shape[2:], mode='bilinear', align_corners=False)
             mask_img = torch.clamp(mask_img, 0, 1)
-            img = img * mask_img + original_img.detach() * (1 - mask_img)
+            
+            # 【核心修改】：引入 blend_ratio
+            # 背景部分 = (1 - ratio) * 生成图背景 + ratio * 原图背景
+            # 最终结果 = ROI区域(生成图) + 背景部分
+            
+            # 计算混合后的背景
+            blended_bg = img * (1 - blend_ratio) + original_img.detach() * blend_ratio
+            
+            # 组合：Mask区域使用纯生成图，(1-Mask)区域使用混合背景
+            img = img * mask_img + blended_bg * (1 - mask_img)
 
-            # 3. 特征层面的混合 (关键修改！！！)
-            # 插值后进行二值化 (Binarize)，防止边缘产生“粘滞”效应
-            # 只有当 mask > 0.5 时才允许特征变化，否则完全锁死
+            # --- 特征混合 ---
             mask_feat_raw = F.interpolate(mask_base, size=feat[feature_idx].shape[2:], mode='bilinear', align_corners=False)
-            mask_feat = (mask_feat_raw > 0.5).float() # <--- 强制变为 0.0 或 1.0
+            mask_feat = (mask_feat_raw > 0.5).float()
 
-            # 调整原始特征尺寸
             orig_feat_resized = F.interpolate(original_feat[feature_idx].detach(), size=feat[feature_idx].shape[2:], mode='bilinear', align_corners=False)
             
-            # 应用混合：Mask=1 的区域(允许动)使用新特征，Mask=0 的区域(背景)锁死旧特征
-            feat[feature_idx] = feat[feature_idx] * mask_feat + orig_feat_resized * (1 - mask_feat)
-
-            # --- 调试代码：检查拖拽点是否被锁死 ---
-            # 如果你的点在 mask=0 的区域，它是绝对动不了的
-            if is_drag and hasattr(self, 'points'):
-                for i, point in enumerate(points):
-                    # 将点坐标映射到特征图尺寸
-                    y_f = int(point[0] / img.shape[2] * feat[feature_idx].shape[2])
-                    x_f = int(point[1] / img.shape[3] * feat[feature_idx].shape[3])
-                    # 检查边界
-                    y_f = min(max(y_f, 0), feat[feature_idx].shape[2]-1)
-                    x_f = min(max(x_f, 0), feat[feature_idx].shape[3]-1)
-                    
-                    # 获取该点位置的 mask 值
-                    mask_val = mask_feat[0, 0, y_f, x_f].item()
-                    if mask_val < 0.5:
-                        print(f"警告: 第 {i} 个拖拽点位于 Mask=0 (固定) 区域，无法移动！请检查掩码绘制是否正确。")
+            # 特征也应用同样的混合比例 (可选，通常特征混合保持硬锁定更稳定，但为了逻辑一致可以加上)
+            blended_feat_bg = feat[feature_idx] * (1 - blend_ratio) + orig_feat_resized * blend_ratio
+            feat[feature_idx] = feat[feature_idx] * mask_feat + blended_feat_bg * (1 - mask_feat)
 
         h, w = G.img_resolution, G.img_resolution
 
@@ -369,44 +391,56 @@ class Renderer:
             tracker_type = kwargs.get('tracker_type', 'NN')
             tracker_lambda = kwargs.get('tracker_lambda', 0.5)
 
-            # Base feature for motion supervision
-            feat_resize = F.interpolate(feat[feature_idx], [h, w], mode='bilinear')
+            # =========================================================================
+            # 3. 准备追踪和 Loss 计算用的特征 (必须来源于 feat_raw)
+            # =========================================================================
+            feat_resize = F.interpolate(feat_raw, [h, w], mode='bilinear')
 
-            # Build tracking feature (single-scale or multi-scale fusion)
+            # Build tracking feature
             track_feat_resize = feat_resize
             if tracker_type in ['MULTISCALE', 'HYBRID', 'HYBRID_LAMBDA']:
                 fuse_indices = [3, 5, 7, 9]
                 fuse_indices = [idx for idx in fuse_indices if idx < len(feat)]
                 if feature_idx not in fuse_indices:
                     fuse_indices.append(feature_idx)
-                feats_to_fuse = [F.interpolate(feat[idx], [h, w], mode='bilinear') for idx in fuse_indices]
+                
+                feats_to_fuse = []
+                for idx in fuse_indices:
+                    # 主特征层必须使用 feat_raw
+                    if idx == feature_idx:
+                        feats_to_fuse.append(F.interpolate(feat_raw, [h, w], mode='bilinear'))
+                    else:
+                        feats_to_fuse.append(F.interpolate(feat[idx], [h, w], mode='bilinear'))
+                
                 track_feat_resize = torch.cat(feats_to_fuse, dim=1)
 
             if self.feat_refs is None:
-                self.feat0_resize = F.interpolate(feat[feature_idx].detach(), [h, w], mode='bilinear')
+                # 初始化参考特征时，必须用 Raw
+                self.feat0_resize = F.interpolate(feat_raw.detach(), [h, w], mode='bilinear')
                 self.feat_refs = []
                 for point in points:
                     py, px = round(point[0]), round(point[1])
                     self.feat_refs.append(track_feat_resize.detach()[:,:,py,px])
-                self.points0_pt = torch.Tensor(points).unsqueeze(0).to(self._device) # 1, N, 2
+                self.points0_pt = torch.Tensor(points).unsqueeze(0).to(self._device)
 
-            # Point tracking
+            # =========================================================================
+            # 4. Point tracking (使用 img_raw 和 track_feat_resize)
+            # =========================================================================
             if tracker_type == 'RAFT' or tracker_type == 'HYBRID':
                 if self.raft_tracker is None:
                     self.raft_tracker = RAFTTracker(device=self._device)
 
-                # Use a fixed reference image/points from drag start to accumulate full displacement.
                 if self.raft_ref_img is None:
-                    self.raft_ref_img = img.detach()
+                    self.raft_ref_img = img_raw.detach() # 使用 Raw
                     self.raft_ref_points = torch.tensor(points, device=self._device, dtype=torch.float32)
 
                 with torch.no_grad():
-                    raft_pred = self.raft_tracker.update_points(self.raft_ref_img, img, self.raft_ref_points)
+                    raft_pred = self.raft_tracker.update_points(self.raft_ref_img, img_raw, self.raft_ref_points)
 
                 if tracker_type == 'RAFT':
                     for j in range(len(points)):
                         points[j] = raft_pred[j].tolist()
-                else:  # HYBRID: use RAFT prediction to guide NN search window
+                else:  # HYBRID
                     guided_points = raft_pred.detach().cpu().tolist()
                     with torch.no_grad():
                         for j, point in enumerate(points):
@@ -418,14 +452,14 @@ class Renderer:
                             right = min(int(round(guide[1])) + r + 1, w)
                             feat_patch = track_feat_resize[:,:,up:down,left:right]
                             L2 = torch.linalg.norm(feat_patch - self.feat_refs[j].reshape(1,-1,1,1), dim=1)
-                            # distance regularizer towards RAFT guide
+                            
                             yy_local, xx_local = torch.meshgrid(
                                 torch.arange(up, down, device=self._device),
                                 torch.arange(left, right, device=self._device),
                                 indexing='ij'
                             )
                             dist = ((yy_local - guide[0])**2 + (xx_local - guide[1])**2).sqrt()
-                            dist = dist.unsqueeze(0)  # broadcast over channel dimension after norm
+                            dist = dist.unsqueeze(0)
                             r_norm = r + 1e-6
                             cost = L2 + tracker_lambda * (dist / r_norm)
                             _, idx = torch.min(cost.view(1,-1), -1)
@@ -434,7 +468,6 @@ class Renderer:
                             points[j] = point
 
             elif tracker_type == 'HYBRID_LAMBDA' or tracker_type == 'MULTISCALE':
-                # HYBRID_LAMBDA here means: no RAFT; but distance prior is zero (falls back to NN). For clarity, treat as NN on multiscale.
                 with torch.no_grad():
                     for j, point in enumerate(points):
                         r = round(r2 / 512 * h)
@@ -450,7 +483,7 @@ class Renderer:
                         points[j] = point
 
             else:
-                # Point tracking with feature matching
+                # NN Tracker
                 with torch.no_grad():
                     for j, point in enumerate(points):
                         r = round(r2 / 512 * h)
@@ -486,12 +519,15 @@ class Renderer:
                     loss_motion += F.l1_loss(feat_resize[:,:,relis,reljs].detach(), target)
 
             loss = loss_motion
-            if mask is not None and not feature_blend:
-                # 仅在未启用特征混合时应用原来的掩码损失
-                if mask.min() == 0 and mask.max() == 1:
-                    mask_usq = mask.to(self._device).unsqueeze(0).unsqueeze(0)
-                    loss_fix = F.l1_loss(feat_resize * mask_usq, self.feat0_resize * mask_usq)
-                    loss += lambda_mask * loss_fix
+            
+            # Mask Loss (约束背景不动)
+            if mask is not None:
+                mask_usq = mask.to(self._device).unsqueeze(0).unsqueeze(0)
+                # 【逻辑】:
+                # 因为上面翻转了mask，现在 1=ROI (动)，0=BG (不动)
+                # 所以我们惩罚 (1-mask) 即惩罚 BG 的变动。
+                loss_fix = F.l1_loss(feat_resize * (1 - mask_usq), self.feat0_resize * (1 - mask_usq))
+                loss += lambda_mask * loss_fix
 
             loss += reg * F.l1_loss(ws, self.w0)  # latent code regularization
             if not res.stop:
@@ -511,5 +547,3 @@ class Renderer:
             img = Image.fromarray(img)
         res.image = img
         res.w = ws.detach().cpu().numpy()
-
-#----------------------------------------------------------------------------

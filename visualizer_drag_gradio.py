@@ -1018,7 +1018,7 @@ with gr.Blocks(css=".top-align-row{align-items:flex-start !important;} .top-alig
                     to_pil=True,
                     tracker_type=global_state['params']['tracker_type'],
                     tracker_lambda=global_state['params']['tracker_lambda'],
-                    stop_thresh_px=global_state['params']['stop_thresh_px'])
+                    stop_thresh_px=global_state['params']['stop_thresh_px'],
                     feature_blend=global_state['params'].get('feature_blend', False),  # 启用特征融合
                     blend_ratio=global_state['params'].get('blend_ratio', 0.5))  # 混合比例
 
