@@ -30,13 +30,10 @@ args = parser.parse_args()
 cache_dir = args.cache_dir
 
 device = 'cuda'
-
-# Initialize inversion module (lazy loading)
 inversion_module = None
 
 
 def get_inversion_module():
-    """Lazy initialization of inversion module."""
     global inversion_module
     if inversion_module is None:
         inversion_module = InversionModule(device=device)
@@ -44,95 +41,73 @@ def get_inversion_module():
 
 
 def invert_uploaded_image(image, method, global_state):
-    """
-    Invert uploaded image to latent space with real-time progress display.
-    
-    Args:
-        image: PIL Image uploaded by user
-        method: 'Optimization' or 'PTI'
-        global_state: application state
-        
-    Yields:
-        tuple: (global_state, progress_image)
-    """
     if image is None:
         yield global_state, None
         return
-    
+
     try:
         inv_module = get_inversion_module()
         renderer = global_state['renderer']
-        
-        # Make sure generator is initialized
+
         if not hasattr(renderer, 'G'):
             print("Generator not initialized, initializing now...")
             init_images(global_state)
-        
+
         G = renderer.G
-        
-        # Create progress display images
+
         from PIL import ImageDraw, ImageFont
-        
+
         def create_progress_image(step, total_steps, loss_info=""):
-            """Create a progress visualization image."""
-            # Match the display size to avoid layout jumping
-            img_size = 1024  # Match StyleGAN resolution
+            img_size = 1024
             img = Image.new('RGB', (img_size, img_size), color=(30, 30, 30))
             draw = ImageDraw.Draw(img)
-            
-            # Try to load font, fallback to default if not available
+
             try:
                 font = ImageFont.truetype('arial.ttf', 48)
                 small_font = ImageFont.truetype('arial.ttf', 32)
-            except:
+            except BaseException:
                 font = ImageFont.load_default()
                 small_font = font
-            
-            # Draw progress bar
+
             bar_width = 800
             bar_height = 60
             bar_x = (img_size - bar_width) // 2
             bar_y = 400
-            
-            # Background
-            draw.rectangle([bar_x, bar_y, bar_x + bar_width, bar_y + bar_height], 
-                          fill=(60, 60, 60), outline=(100, 100, 100), width=2)
-            
-            # Progress fill
+
+            draw.rectangle([bar_x, bar_y, bar_x + bar_width, bar_y + bar_height],
+                           fill=(60, 60, 60), outline=(100, 100, 100), width=2)
+
             progress = step / total_steps
             fill_width = int(bar_width * progress)
             draw.rectangle([bar_x, bar_y, bar_x + fill_width, bar_y + bar_height],
-                          fill=(0, 150, 255))
-            
-            # Text
-            text = f"Optimizing: {step}/{total_steps} ({progress*100:.1f}%)"
+                           fill=(0, 150, 255))
+
+            text = f"Optimizing: {step}/{total_steps} ({progress * 100:.1f}%)"
             bbox = draw.textbbox((0, 0), text, font=font)
             text_width = bbox[2] - bbox[0]
-            draw.text((img_size//2 - text_width//2, 300), text, fill=(255, 255, 255), font=font)
-            
+            draw.text((img_size // 2 - text_width // 2, 300), text, fill=(255, 255, 255), font=font)
+
             if loss_info:
                 bbox = draw.textbbox((0, 0), loss_info, font=small_font)
                 text_width = bbox[2] - bbox[0]
-                draw.text((img_size//2 - text_width//2, 500), loss_info, fill=(200, 200, 200), font=small_font)
-            
+                draw.text((img_size // 2 - text_width // 2, 500), loss_info, fill=(200, 200, 200), font=small_font)
+
             return img
-        
-        # Choose inversion method
+
         if method == 'PTI':
-            num_steps = 450 + 350  # Initial inversion + PTI steps
+            num_steps = 450 + 350
             print(f"Starting PTI inversion with {num_steps} total steps...")
             yield global_state, create_progress_image(0, num_steps, "Initializing PTI...")
-            
+
             from inversion_utils import InversionModule
             inv_module = InversionModule(device=device)
-            
-            # Shared list to collect progress updates
+
             progress_updates = []
-            
+
             def progress_callback(step, loss):
                 loss_info = f"Loss: {loss:.4f}"
                 progress_updates.append((step, loss_info))
-            
+
             try:
                 w_latent, G_tuned = inv_module.pti_invert(
                     image, G,
@@ -142,35 +117,29 @@ def invert_uploaded_image(image, method, global_state):
                     initial_lr=8e-3,
                     progress_callback=progress_callback
                 )
-                
-                # Yield collected progress updates
+
                 for step, loss_info in progress_updates:
                     yield global_state, create_progress_image(step, num_steps, loss_info)
-                
-                # Use fine-tuned generator
+
                 G = G_tuned
                 print(f'PTI inversion completed!')
             except Exception as e:
                 print(f"PTI inversion failed: {e}, falling back to optimization")
                 method = 'Optimization'
                 num_steps = 3000
-        
+
         if method == 'Optimization':
             num_steps = 3000
             print(f"Starting optimization inversion with {num_steps} steps...")
-            
-            # Show initial progress
             yield global_state, create_progress_image(0, num_steps, "Initializing...")
-            
+
             from inversion_utils import InversionModule
             inv_module = InversionModule(device=device)
-            
-            # Inline optimization with yield
+
             import copy
             from torchvision import transforms
             import torch.nn.functional as F
-            
-            # Preprocess
+
             target_h = G.img_resolution
             target_w = G.img_resolution
             transform = transforms.Compose([
@@ -179,66 +148,61 @@ def invert_uploaded_image(image, method, global_state):
                 transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
             ])
             img_tensor = transform(image).unsqueeze(0).to(device)
-            
-            # Setup
+
             G_copy = copy.deepcopy(G).eval().requires_grad_(False).to(device)
             z_samples = torch.randn([10000, G_copy.z_dim], device=device)
             with torch.no_grad():
                 w_samples = G_copy.mapping(z_samples, None)[:, :1, :]
                 w_avg = w_samples.mean(dim=0, keepdim=True)
-            
+
             w = w_avg.detach().clone().repeat(1, G_copy.num_ws, 1)
             w.requires_grad = True
-            
+
             optimizer = torch.optim.Adam([w], lr=0.01, betas=(0.9, 0.999))
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_steps)
-            
-            # LPIPS
+
             try:
                 from lpips import LPIPS
                 lpips_fn = LPIPS(net='alex').to(device).eval()
                 for param in lpips_fn.parameters():
                     param.requires_grad = False
-            except:
+            except BaseException:
                 lpips_fn = None
-            
+
             best_loss = float('inf')
             best_w = w.detach().clone()
-            
-            # Optimization loop with progress updates
+
             for step in range(num_steps):
                 synth_img = G_copy.synthesis(w, noise_mode='const')
                 mse_loss = F.mse_loss(synth_img, img_tensor)
-                
+
                 if lpips_fn is not None:
                     lpips_loss = lpips_fn(synth_img, img_tensor).mean()
                     total_loss = mse_loss * 1.0 + lpips_loss * 1.0
                 else:
                     total_loss = mse_loss
-                
+
                 if step < num_steps // 2:
                     w_reg = ((w - w_avg.repeat(1, G_copy.num_ws, 1)) ** 2).mean() * 0.01
                     total_loss = total_loss + w_reg
-                
+
                 optimizer.zero_grad()
                 total_loss.backward()
                 optimizer.step()
                 scheduler.step()
-                
+
                 if total_loss.item() < best_loss:
                     best_loss = total_loss.item()
                     best_w = w.detach().clone()
-                
-                # Yield progress
+
                 if step % 50 == 0 or step == num_steps - 1:
                     progress_img = create_progress_image(step + 1, num_steps, f"Loss: {total_loss.item():.4f}")
                     yield global_state, progress_img
                     print(f'Step {step}/{num_steps}: Loss={total_loss.item():.4f}')
-            
+
             w_latent = best_w
             print(f'Optimization completed! Best loss: {best_loss:.4f}')
-        
-        # Reconstruct and update state
+
         global_state['inversion_mode'] = True
         global_state['uploaded_image'] = image
         global_state['renderer'].w_load = w_latent
@@ -254,30 +218,29 @@ def invert_uploaded_image(image, method, global_state):
             None,
             global_state['params']['lr']
         )
-        
+
         global_state['renderer']._render_drag_impl(
             global_state['generator_params'],
             is_drag=False,
             to_pil=True
         )
-        
+
         reconstructed_image = global_state['generator_params'].image
         global_state['images']['image_orig'] = reconstructed_image
         global_state['images']['image_raw'] = reconstructed_image
         global_state['images']['image_show'] = Image.fromarray(
             add_watermark_np(np.array(reconstructed_image))
         )
-        
+
         clear_state(global_state)
-        
+
         print("Successfully inverted image")
         yield global_state, global_state['images']['image_show']
-        
+
     except Exception as e:
         print(f"Error during inversion: {e}")
         import traceback
         traceback.print_exc()
-        # Return error image
         error_img = Image.new('RGB', (512, 512), color=(50, 0, 0))
         draw = ImageDraw.Draw(error_img)
         draw.text((150, 250), f"Error: {str(e)[:50]}", fill=(255, 255, 255))
@@ -292,11 +255,6 @@ def reverse_point_pairs(points):
 
 
 def clear_state(global_state, target=None):
-    """Clear target history state from global_state
-    If target is not defined, points and mask will be both removed.
-    1. set global_state['points'] as empty dict
-    2. set global_state['mask'] as full-one mask.
-    """
     if target is None:
         target = ['point', 'mask']
     if not isinstance(target, list):
@@ -314,30 +272,22 @@ def clear_state(global_state, target=None):
 
 
 def init_images(global_state):
-    """This function is called only ones with Gradio App is started.
-    0. pre-process global_state, unpack value from global_state of need
-    1. Re-init renderer
-    2. run `renderer._render_drag_impl` with `is_drag=False` to generate
-       new image
-    3. Assign images to global state and re-generate mask
-    """
-
     if isinstance(global_state, gr.State):
         state = global_state.value
     else:
         state = global_state
 
     state['renderer'].init_network(
-        state['generator_params'],  # res
-        valid_checkpoints_dict[state['pretrained_weight']],  # pkl
-        state['params']['seed'],  # w0_seed,
-        None,  # w_load
-        state['params']['latent_space'] == 'w+',  # w_plus
+        state['generator_params'],
+        valid_checkpoints_dict[state['pretrained_weight']],
+        state['params']['seed'],
+        None,
+        state['params']['latent_space'] == 'w+',
         'const',
-        state['params']['trunc_psi'],  # trunc_psi,
-        state['params']['trunc_cutoff'],  # trunc_cutoff,
-        None,  # input_transform
-        state['params']['lr'],  # lr,
+        state['params']['trunc_psi'],
+        state['params']['trunc_cutoff'],
+        None,
+        state['params']['lr'],
     )
 
     state['renderer']._render_drag_impl(state['generator_params'],
@@ -368,7 +318,6 @@ def update_image_draw(image, points, mask, show_mask, global_state=None):
 
 
 def serialize_points(points):
-    """Convert points dict to JSON string for reproducible export."""
     payload = []
     for idx in sorted(points.keys()):
         p = points[idx]
@@ -382,7 +331,6 @@ def serialize_points(points):
 
 
 def deserialize_points(points_json):
-    """Parse JSON string to points dict format used by UI."""
     data = json.loads(points_json) if points_json else []
     points = {}
     for i, item in enumerate(data):
@@ -398,23 +346,14 @@ def deserialize_points(points_json):
 
 
 def preprocess_mask_info(global_state, image):
-    """Function to handle mask information.
-    1. last_mask is None: Do not need to change mask, return mask
-    2. last_mask is not None:
-        2.1 global_state is remove_mask:
-        2.2 global_state is add_mask:
-    """
     if isinstance(image, dict):
         last_mask = get_valid_mask(image['mask'])
     else:
         last_mask = None
     mask = global_state['mask']
 
-    # mask in global state is a placeholder with all 1.
     if (mask == 1).all():
         mask = last_mask
-
-    # last_mask = global_state['last_mask']
     editing_mode = global_state['editing_state']
 
     if last_mask is None:
@@ -432,7 +371,6 @@ def preprocess_mask_info(global_state, image):
               'do nothing to mask.')
 
     global_state['mask'] = updated_mask
-    # global_state['last_mask'] = None  # clear buffer
     return global_state
 
 
@@ -450,20 +388,15 @@ init_pkl = 'stylegan2_lions_512_pytorch'
 
 with gr.Blocks(css=".top-align-row{align-items:flex-start !important;} .top-align-col{align-self:flex-start !important;} .drag-image img{margin-top:0 !important;}") as app:
 
-    # renderer = Renderer()
     global_state = gr.State({
         "images": {
-            # image_orig: the original image, change with seed/model is changed
-            # image_raw: image with mask and points, change durning optimization
-            # image_show: image showed on screen
         },
         "temporal_params": {
-            # stop
         },
         'mask':
-        None,  # mask for visualization, 1 for editing and 0 for unchange
-        'last_mask': None,  # last edited mask
-        'show_mask': True,  # add button
+        None,
+        'last_mask': None,
+        'show_mask': True,
         "generator_params": dnnlib.EasyDict(),
         "params": {
             "seed": 0,
@@ -479,8 +412,8 @@ with gr.Blocks(css=".top-align-row{align-items:flex-start !important;} .top-alig
             "tracker_lambda": 0.5,
             "max_steps": 200,
             "stop_thresh_px": 2,
-            "feature_blend": False,  # 是否启用特征融合
-            "blend_ratio": 0.5,      # 特征融合比例
+            "feature_blend": False,
+            "blend_ratio": 0.5,
         },
         "device": device,
         "draw_interval": 1,
@@ -490,22 +423,16 @@ with gr.Blocks(css=".top-align-row{align-items:flex-start !important;} .top-alig
         "curr_type_point": "start",
         'editing_state': 'add_points',
         'pretrained_weight': init_pkl,
-        # New fields for inversion
-        'inversion_mode': False,  # Flag to indicate if using inverted image
-        'uploaded_image': None,  # Store original uploaded image
+        'inversion_mode': False,
+        'uploaded_image': None,
     })
-
-    # init image
     global_state = init_images(global_state)
 
     with gr.Row():
 
         with gr.Row(elem_classes=["top-align-row"]):
 
-            # Left --> tools
             with gr.Column(scale=3):
-
-                # Pickle
                 with gr.Row():
 
                     with gr.Column(scale=1, min_width=10):
@@ -518,7 +445,6 @@ with gr.Blocks(css=".top-align-row{align-items:flex-start !important;} .top-alig
                             value=init_pkl,
                         )
 
-                # Latent
                 with gr.Row():
                     with gr.Column(scale=1, min_width=10):
                         gr.Markdown(value='Latent', show_label=False)
@@ -533,7 +459,7 @@ with gr.Blocks(css=".top-align-row{align-items:flex-start !important;} .top-alig
                             value=global_state.value["params"]["lr"],
                             interactive=True,
                             label="Step Size")
-                        
+
                         form_tracker_type = gr.Radio(
                             ['NN', 'RAFT', 'HYBRID', 'MULTISCALE'],
                             value=global_state.value['params']['tracker_type'],
@@ -576,12 +502,11 @@ with gr.Blocks(css=".top-align-row{align-items:flex-start !important;} .top-alig
                                     label='Latent space to optimize',
                                     show_label=False,
                                 )
-                
-                # GAN Inversion - Upload Real Image
+
                 with gr.Row():
                     with gr.Column(scale=1, min_width=10):
                         gr.Markdown(value='Upload', show_label=False)
-                    
+
                     with gr.Column(scale=4, min_width=10):
                         upload_image = gr.Image(
                             type="pil",
@@ -597,10 +522,6 @@ with gr.Blocks(css=".top-align-row{align-items:flex-start !important;} .top-alig
                         )
                         invert_button = gr.Button("Invert Image")
 
-
-
-
-                # Drag
                 with gr.Row():
                     with gr.Column(scale=1, min_width=10):
                         gr.Markdown(value='Drag', show_label=False)
@@ -631,7 +552,6 @@ with gr.Blocks(css=".top-align-row{align-items:flex-start !important;} .top-alig
                             visible=False,
                         )
 
-                # Points IO
                 with gr.Row():
                     with gr.Column(scale=1, min_width=10):
                         gr.Markdown(value='Points IO', show_label=False)
@@ -646,7 +566,6 @@ with gr.Blocks(css=".top-align-row{align-items:flex-start !important;} .top-alig
                             interactive=True,
                         )
 
-                # Mask
                 with gr.Row():
                     with gr.Column(scale=1, min_width=10):
                         gr.Markdown(value='Mask', show_label=False)
@@ -674,7 +593,7 @@ with gr.Blocks(css=".top-align-row{align-items:flex-start !important;} .top-alig
                                 label='Enable Feature Blend',
                                 value=global_state.value["params"]["feature_blend"],
                                 show_label=True)
-                            
+
                             blend_ratio_slider = gr.Slider(
                                 minimum=0.0,
                                 maximum=1.0,
@@ -689,7 +608,6 @@ with gr.Blocks(css=".top-align-row{align-items:flex-start !important;} .top-alig
                     interactive=True,
                     visible=False)
 
-            # Right --> Image (在右侧栏顶部)
             with gr.Column(scale=8, elem_classes=["top-align-col"]):
                 form_image = ImageMask(
                     value=global_state.value['images']['image_show'],
@@ -746,12 +664,7 @@ with gr.Blocks(css=".top-align-row{align-items:flex-start !important;} .top-alig
         </div>
         """)
 
-    # Network & latents tab listeners
     def on_change_pretrained_dropdown(pretrained_value, global_state):
-        """Function to handle model change.
-        1. Set pretrained value to global_state
-        2. Re-init images and clear all states
-        """
 
         global_state['pretrained_weight'] = pretrained_value
         init_images(global_state)
@@ -766,10 +679,6 @@ with gr.Blocks(css=".top-align-row{align-items:flex-start !important;} .top-alig
     )
 
     def on_click_reset_image(global_state):
-        """Reset image to the original one and clear all states
-        1. Re-init images
-        2. Clear all states
-        """
 
         init_images(global_state)
         clear_state(global_state)
@@ -781,21 +690,15 @@ with gr.Blocks(css=".top-align-row{align-items:flex-start !important;} .top-alig
         inputs=[global_state],
         outputs=[global_state, form_image],
     )
-    
-    # GAN Inversion button click handler
+
     invert_button.click(
         invert_uploaded_image,
         inputs=[upload_image, inversion_method, global_state],
         outputs=[global_state, form_image],
-        show_progress="hidden"  # Hide default progress to avoid UI jumping
+        show_progress="hidden"
     )
 
-    # Update parameters
     def on_change_update_image_seed(seed, global_state):
-        """Function to handle generation seed change.
-        1. Set seed to global_state
-        2. Re-init images and clear all states
-        """
 
         global_state["params"]["seed"] = int(seed)
         init_images(global_state)
@@ -810,11 +713,6 @@ with gr.Blocks(css=".top-align-row{align-items:flex-start !important;} .top-alig
     )
 
     def on_click_latent_space(latent_space, global_state):
-        """Function to reset latent space to optimize.
-        NOTE: this function we reset the image and all controls
-        1. Set latent-space to global_state
-        2. Re-init images and clear all state
-        """
 
         global_state['params']['latent_space'] = latent_space
         init_images(global_state)
@@ -826,19 +724,18 @@ with gr.Blocks(css=".top-align-row{align-items:flex-start !important;} .top-alig
                              inputs=[form_latent_space, global_state],
                              outputs=[global_state, form_image])
 
-    # ==== Params
     form_lambda_number.change(
         partial(on_change_single_global_state, ["params", "motion_lambda"]),
         inputs=[form_lambda_number, global_state],
         outputs=[global_state],
     )
-    
+
     feature_blend_checkbox.change(
         partial(on_change_single_global_state, ["params", "feature_blend"]),
         inputs=[feature_blend_checkbox, global_state],
         outputs=[global_state],
     )
-    
+
     blend_ratio_slider.change(
         partial(on_change_single_global_state, ["params", "blend_ratio"]),
         inputs=[blend_ratio_slider, global_state],
@@ -900,7 +797,6 @@ with gr.Blocks(css=".top-align-row{align-items:flex-start !important;} .top-alig
     )
 
     def on_click_start(global_state, image, max_steps_val, stop_thresh_val):
-        # sync latest numeric inputs in case change events didn't fire
         if max_steps_val is not None:
             global_state['params']['max_steps'] = int(max_steps_val)
         if stop_thresh_val is not None:
@@ -913,12 +809,8 @@ with gr.Blocks(css=".top-align-row{align-items:flex-start !important;} .top-alig
         t_in_pixels = []
         valid_points = []
 
-        # handle of start drag in mask editing mode
         global_state = preprocess_mask_info(global_state, image)
-
-        # Prepare the points for the inference
         if len(global_state["points"]) == 0:
-            # yield on_click_start_wo_points(global_state, image)
             image_raw = global_state['images']['image_raw']
             update_image_draw(
                 image_raw,
@@ -932,34 +824,28 @@ with gr.Blocks(css=".top-align-row{align-items:flex-start !important;} .top-alig
                 global_state,
                 0,
                 global_state['images']['image_show'],
-                # gr.File.update(visible=False),
                 gr.Button.update(interactive=True),
                 gr.Button.update(interactive=True),
                 gr.Button.update(interactive=True),
                 gr.Button.update(interactive=True),
                 gr.Button.update(interactive=True),
-                # latent space
                 gr.Radio.update(interactive=True),
                 gr.Button.update(interactive=True),
-                # NOTE: disable stop button
                 gr.Button.update(interactive=False),
-
-                # update other comps
                 gr.Dropdown.update(interactive=True),
                 gr.Number.update(interactive=True),
                 gr.Number.update(interactive=True),
-                gr.Radio.update(interactive=True),  # tracker_type
-                gr.Slider.update(interactive=True), # tracker_lambda
-                gr.Number.update(interactive=True), # max_steps
-                gr.Number.update(interactive=True), # stop_thresh
-                gr.Checkbox.update(interactive=True), # show_mask
-                gr.Number.update(interactive=True), # lambda (mask)
+                gr.Radio.update(interactive=True),
+                gr.Slider.update(interactive=True),
+                gr.Number.update(interactive=True),
+                gr.Number.update(interactive=True),
+                gr.Checkbox.update(interactive=True),
+                gr.Number.update(interactive=True),
                 gr.Textbox.update(value=""),
                 None,
             )
         else:
 
-            # Transform the points into torch tensors
             for key_point, point in global_state["points"].items():
                 try:
                     p_start = point.get("start_temp", point["start"])
@@ -982,7 +868,6 @@ with gr.Blocks(css=".top-align-row{align-items:flex-start !important;} .top-alig
             global_state['temporal_params']['stop'] = False
             global_state['editing_state'] = 'running'
 
-            # reverse points order
             p_to_opt = reverse_point_pairs(p_in_pixels)
             t_to_opt = reverse_point_pairs(t_in_pixels)
             print('Running with:')
@@ -993,34 +878,24 @@ with gr.Blocks(css=".top-align-row{align-items:flex-start !important;} .top-alig
                 if global_state["temporal_params"]["stop"]:
                     break
 
-                # do drage here!
                 renderer._render_drag_impl(
                     global_state['generator_params'],
-                    p_to_opt,  # point
-                    t_to_opt,  # target
-                    drag_mask,  # mask,
-                    global_state['params']['motion_lambda'],  # lambda_mask
+                    p_to_opt,
+                    t_to_opt,
+                    drag_mask,
+                    global_state['params']['motion_lambda'],
                     reg=0,
-                    feature_idx=5,  # NOTE: do not support change for now
-                    r1=global_state['params']['r1_in_pixels'],  # r1
-                    r2=global_state['params']['r2_in_pixels'],  # r2
-                    # random_seed     = 0,
-                    # noise_mode      = 'const',
+                    feature_idx=5,
+                    r1=global_state['params']['r1_in_pixels'],
+                    r2=global_state['params']['r2_in_pixels'],
                     trunc_psi=global_state['params']['trunc_psi'],
-                    # force_fp32      = False,
-                    # layer_name      = None,
-                    # sel_channels    = 3,
-                    # base_channel    = 0,
-                    # img_scale_db    = 0,
-                    # img_normalize   = False,
-                    # untransform     = False,
                     is_drag=True,
                     to_pil=True,
                     tracker_type=global_state['params']['tracker_type'],
                     tracker_lambda=global_state['params']['tracker_lambda'],
                     stop_thresh_px=global_state['params']['stop_thresh_px'],
-                    feature_blend=global_state['params'].get('feature_blend', False),  # 启用特征融合
-                    blend_ratio=global_state['params'].get('blend_ratio', 0.5))  # 混合比例
+                    feature_blend=global_state['params'].get('feature_blend', False),
+                    blend_ratio=global_state['params'].get('blend_ratio', 0.5))
 
                 if step_idx % global_state['draw_interval'] == 0:
                     print('Current Source:')
@@ -1048,12 +923,11 @@ with gr.Blocks(css=".top-align-row{align-items:flex-start !important;} .top-alig
                     )
                     global_state['images']['image_raw'] = image_result
 
-                # compute distances for monitoring
                 dists = []
                 for p_i, t_i in zip(p_to_opt, t_to_opt):
                     dy = p_i[0] - t_i[0]
                     dx = p_i[1] - t_i[1]
-                    dists.append((dy*dy + dx*dx) ** 0.5)
+                    dists.append((dy * dy + dx * dx) ** 0.5)
                 if len(dists) > 0:
                     mean_dist = sum(dists) / len(dists)
                     dist_text = f"mean={mean_dist:.2f}px; per-point={['{:.2f}'.format(d) for d in dists]}"
@@ -1065,33 +939,26 @@ with gr.Blocks(css=".top-align-row{align-items:flex-start !important;} .top-alig
                     global_state,
                     step_idx,
                     global_state['images']['image_show'],
-                    # gr.File.update(visible=False),
                     gr.Button.update(interactive=False),
                     gr.Button.update(interactive=False),
                     gr.Button.update(interactive=False),
                     gr.Button.update(interactive=False),
                     gr.Button.update(interactive=False),
-                    # latent space
                     gr.Radio.update(interactive=False),
                     gr.Button.update(interactive=False),
-                    # enable stop button in loop
                     gr.Button.update(interactive=True),
-
-                    # update other comps
                     gr.Dropdown.update(interactive=False),
                     gr.Number.update(interactive=False),
                     gr.Number.update(interactive=False),
-                    gr.Radio.update(interactive=False),  # tracker_type
-                    gr.Slider.update(interactive=False), # tracker_lambda
-                    gr.Number.update(interactive=False), # max_steps
-                    gr.Number.update(interactive=False), # stop_thresh
-                    gr.Checkbox.update(interactive=False), # show_mask
-                    gr.Number.update(interactive=False), # lambda (mask)
+                    gr.Radio.update(interactive=False),
+                    gr.Slider.update(interactive=False),
+                    gr.Number.update(interactive=False),
+                    gr.Number.update(interactive=False),
+                    gr.Checkbox.update(interactive=False),
+                    gr.Number.update(interactive=False),
                     gr.Textbox.update(value=dist_text),
                     None,
                 )
-
-                # increate step
                 step_idx += 1
 
                 if step_idx >= global_state['params']['max_steps']:
@@ -1106,7 +973,6 @@ with gr.Blocks(css=".top-align-row{align-items:flex-start !important;} .top-alig
                                            global_state['show_mask'],
                                            global_state)
 
-            # build download filename
             model_name = sanitize_name(global_state['pretrained_weight'])
             tracker_type = sanitize_name(global_state['params']['tracker_type'])
             lambda_part = ''
@@ -1120,7 +986,6 @@ with gr.Blocks(css=".top-align-row{align-items:flex-start !important;} .top-alig
             filename = sanitize_name(filename)
             download_path = osp.join(tempfile.gettempdir(), filename)
             try:
-                # save overlay image with points/lines/mask drawn
                 image_draw.save(download_path)
                 download_value = download_path
                 download_visible = True
@@ -1129,39 +994,31 @@ with gr.Blocks(css=".top-align-row{align-items:flex-start !important;} .top-alig
                 download_value = None
                 download_visible = False
 
-            # fp = NamedTemporaryFile(suffix=".png", delete=False)
-            # image_result.save(fp, "PNG")
-
             global_state['editing_state'] = 'add_points'
 
             yield (
                 global_state,
-                0,  # reset step to 0 after stop.
+                0,
                 global_state['images']['image_show'],
-                # gr.File.update(visible=True, value=fp.name),
                 gr.Button.update(interactive=True),
                 gr.Button.update(interactive=True),
                 gr.Button.update(interactive=True),
                 gr.Button.update(interactive=True),
                 gr.Button.update(interactive=True),
-                # latent space
                 gr.Radio.update(interactive=True),
                 gr.Button.update(interactive=True),
-                # NOTE: disable stop button with loop finish
                 gr.Button.update(interactive=False),
-
-                # update other comps
                 gr.Dropdown.update(interactive=True),
                 gr.Number.update(interactive=True),
                 gr.Number.update(interactive=True),
-                gr.Radio.update(interactive=True),  # tracker_type
-                gr.Slider.update(interactive=True), # tracker_lambda
-                gr.Number.update(interactive=True), # max_steps
-                gr.Number.update(interactive=True), # stop_thresh
+                gr.Radio.update(interactive=True),
+                gr.Slider.update(interactive=True),
+                gr.Number.update(interactive=True),
+                gr.Number.update(interactive=True),
                 gr.Button.update(interactive=True),
                 gr.Button.update(interactive=True),
-                gr.Checkbox.update(interactive=True), # show_mask
-                gr.Number.update(interactive=True), # lambda (mask)
+                gr.Checkbox.update(interactive=True),
+                gr.Number.update(interactive=True),
                 gr.Textbox.update(),
                 gr.File.update(value=download_value, visible=download_visible),
             )
@@ -1173,8 +1030,6 @@ with gr.Blocks(css=".top-align-row{align-items:flex-start !important;} .top-alig
             global_state,
             form_steps_number,
             form_image,
-            # form_download_result_file,
-            # >>> buttons
             form_reset_image,
             enable_add_points,
             enable_add_mask,
@@ -1183,8 +1038,6 @@ with gr.Blocks(css=".top-align-row{align-items:flex-start !important;} .top-alig
             form_latent_space,
             form_start_btn,
             form_stop_btn,
-            # <<< buttonm
-            # >>> inputs comps
             form_pretrained_dropdown,
             form_seed_number,
             form_lr_number,
@@ -1200,10 +1053,6 @@ with gr.Blocks(css=".top-align-row{align-items:flex-start !important;} .top-alig
     )
 
     def on_click_stop(global_state):
-        """Function to handle stop button is clicked.
-        1. send a stop signal by set global_state["temporal_params"]["stop"] as True
-        2. Disable Stop button
-        """
         global_state["temporal_params"]["stop"] = True
 
         return global_state, gr.Button.update(interactive=False)
@@ -1236,7 +1085,6 @@ with gr.Blocks(css=".top-align-row{align-items:flex-start !important;} .top-alig
             global_state,
         )
 
-    # Mask
     def on_click_reset_mask(global_state):
         global_state['mask'] = np.ones(
             (
@@ -1257,13 +1105,7 @@ with gr.Blocks(css=".top-align-row{align-items:flex-start !important;} .top-alig
         outputs=[global_state, form_image],
     )
 
-    # Image
     def on_click_enable_draw(global_state, image):
-        """Function to start add mask mode.
-        1. Preprocess mask info from last state
-        2. Change editing state to add_mask
-        3. Set curr image with points and mask
-        """
         global_state = preprocess_mask_info(global_state, image)
         global_state['editing_state'] = 'add_mask'
         image_raw = global_state['images']['image_raw']
@@ -1274,11 +1116,6 @@ with gr.Blocks(css=".top-align-row{align-items:flex-start !important;} .top-alig
                 gr.Image.update(value=image_draw, interactive=True))
 
     def on_click_remove_draw(global_state, image):
-        """Function to start remove mask mode.
-        1. Preprocess mask info from last state
-        2. Change editing state to remove_mask
-        3. Set curr image with points and mask
-        """
         global_state = preprocess_mask_info(global_state, image)
         global_state['edinting_state'] = 'remove_mask'
         image_raw = global_state['images']['image_raw']
@@ -1296,12 +1133,6 @@ with gr.Blocks(css=".top-align-row{align-items:flex-start !important;} .top-alig
                           ])
 
     def on_click_add_point(global_state, image: dict):
-        """Function switch from add mask mode to add points mode.
-        1. Updaste mask buffer if need
-        2. Change global_state['editing_state'] to 'add_points'
-        3. Set current image with mask
-        """
-
         global_state = preprocess_mask_info(global_state, image)
         global_state['editing_state'] = 'add_points'
         mask = global_state['mask']
@@ -1351,8 +1182,6 @@ with gr.Blocks(css=".top-align-row{align-items:flex-start !important;} .top-alig
     )
 
     def on_click_image(global_state, evt: gr.SelectData):
-        """This function only support click for point selection
-        """
         xy = evt.index
         if global_state['editing_state'] != 'add_points':
             print(f'In {global_state["editing_state"]} state. '
@@ -1391,11 +1220,6 @@ with gr.Blocks(css=".top-align-row{align-items:flex-start !important;} .top-alig
     )
 
     def on_click_clear_points(global_state):
-        """Function to handle clear all control points
-        1. clear global_state['points'] (clear_state)
-        2. re-init network
-        2. re-draw image
-        """
         clear_state(global_state, target='point')
 
         renderer: Renderer = global_state["renderer"]
@@ -1411,7 +1235,6 @@ with gr.Blocks(css=".top-align-row{align-items:flex-start !important;} .top-alig
                       outputs=[global_state, form_image])
 
     def on_click_show_mask(global_state, show_mask):
-        """Function to control whether show mask on image."""
         global_state['show_mask'] = show_mask
 
         image_raw = global_state['images']['image_raw']
