@@ -57,6 +57,8 @@ Then install the additional requirements
 pip install -r requirements.txt
 ```
 
+Note: A pinned backup requirements file is available at [requirements.lock.txt](requirements.lock.txt). It captures the exact package versions from the current stylegan3 environment as of 2026-01-18.
+
 Otherwise (for GPU acceleration on MacOS with Silicon Mac M1/M2, or just CPU) try the following:
 
 ```sh
